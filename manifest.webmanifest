@@ -1,0 +1,15 @@
+{
+  "name": "账期助手",
+  "short_name": "账期助手",
+  "description": "商家账期管理、手写票据识别与到期提醒",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f3f2f8",
+  "theme_color": "#2f2a86",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
