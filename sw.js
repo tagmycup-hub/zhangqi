@@ -1,6 +1,6 @@
 /* 账期助手 Service Worker：离线应用壳 + 显示通知。
  * 注意：没有服务端调度器时，Service Worker 不能在未来某个时间准点唤醒提醒。 */
-const CACHE = 'zqzs-v1';
+const CACHE = 'zqzs-v2';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (e) => {
