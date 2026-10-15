@@ -1,6 +1,6 @@
 /* 账期助手 Service Worker：离线应用壳 + 显示通知。
  * 注意：没有服务端调度器时，Service Worker 不能在未来某个时间准点唤醒提醒。 */
-const CACHE = 'zqzs-v2';
+const CACHE = 'zqzs-v3';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (e) => {
@@ -18,6 +18,9 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.pathname.startsWith('/api/')) return; // 识别接口不缓存
+  // 跨域请求（Supabase 同步与识别函数、自建识别服务等）直接走网络，不经过 Service Worker
+  const cdn = /fonts\.(googleapis|gstatic)\.com|jsdelivr|tessdata/.test(url.host);
+  if (url.origin !== location.origin && !cdn) return;
   if (req.mode === 'navigate') {
     // 页面：网络优先，离线回退到缓存的应用壳
     e.respondWith(
@@ -37,7 +40,7 @@ self.addEventListener('fetch', (e) => {
       (hit) =>
         hit ||
         fetch(req).then((res) => {
-          if (res.ok && (url.origin === location.origin || /fonts\.(googleapis|gstatic)\.com|jsdelivr|tessdata/.test(url.host))) {
+          if (res.ok) {
             const copy = res.clone();
             caches.open(CACHE).then((c) => c.put(req, copy));
           }
