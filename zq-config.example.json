@@ -1,0 +1,5 @@
+{
+  "supabaseUrl": "https://你的项目.supabase.co",
+  "publishableKey": "sb_publishable_xxxxxxxxxxxxxxxx",
+  "functionName": "recognize"
+}

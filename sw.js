@@ -1,6 +1,6 @@
 /* 账期助手 Service Worker：离线应用壳 + 显示通知。
  * 注意：没有服务端调度器时，Service Worker 不能在未来某个时间准点唤醒提醒。 */
-const CACHE = 'zqzs-v3';
+const CACHE = 'zqzs-v4';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (e) => {
@@ -64,7 +64,11 @@ self.addEventListener('notificationclick', (e) => {
   const url = (e.notification.data && e.notification.data.url) || './';
   e.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
-      for (const c of list) if ('focus' in c) return c.focus();
+      for (const c of list)
+        if ('focus' in c) {
+          if ('navigate' in c && url !== './') c.navigate(url).catch(() => {});
+          return c.focus();
+        }
       return self.clients.openWindow(url);
     }),
   );

@@ -50,7 +50,10 @@ function createHandler({ prompt, log = () => {
       apiKey: provider === "gemini" ? gKey : aKey,
       model: provider === "gemini" ? env.GEMINI_MODEL || "gemini-3.8-flash" : env.ANTHROPIC_MODEL || "claude-sonnet-5",
       apiUrl: provider === "gemini" ? env.GEMINI_API_URL || "https://generativelanguage.googleapis.com/v1beta" : env.ANTHROPIC_API_URL || "https://api.anthropic.com/v1/messages",
-      thinking: env.GEMINI_THINKING || "",
+      thinking: env.GEMINI_THINKING === "off" ? "" : env.GEMINI_THINKING || "low",
+      fallbacks: String(env.GEMINI_FALLBACK_MODELS || "").split(",").map((s) => s.trim()).filter(Boolean),
+      /** 整个识别请求的时间预算（Supabase 函数最长约 150 秒） */
+      budget: Number(env.RECOGNIZE_BUDGET_MS || 12e4),
       origins: String(env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim().replace(/\/$/, "")).filter(Boolean),
       tokens: String(env.ACCESS_TOKEN || "").split(",").map((s) => s.trim()).filter(Boolean),
       maxBytes: Number(env.MAX_IMAGE_BYTES || 6 * 1024 * 1024),
@@ -82,9 +85,9 @@ function createHandler({ prompt, log = () => {
     return {};
   }
   const json = (status, obj, extra = {}) => new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...extra } });
-  async function post(c, url, headers, body) {
+  async function post(c, url, headers, body, timeout = c.timeout) {
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), c.timeout);
+    const timer = setTimeout(() => ctl.abort(), timeout);
     try {
       return await fetch(url, { method: "POST", signal: ctl.signal, headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
     } catch (e) {
@@ -94,51 +97,135 @@ function createHandler({ prompt, log = () => {
       clearTimeout(timer);
     }
   }
-  function upstreamError(c, status, detail = "") {
-    log(`[recognize] upstream ${c.provider} HTTP ${status}`);
+  function upstreamMessage(detail) {
+    try {
+      const j = JSON.parse(detail);
+      const m = j?.error?.message || j?.message || "";
+      return String(m).replace(/\s+/g, " ").slice(0, 160);
+    } catch {
+      return "";
+    }
+  }
+  function upstreamError(c, status, detail = "", model = c.model) {
+    const msg = upstreamMessage(detail);
+    log(`[recognize] upstream ${c.provider} ${model} HTTP ${status}${msg ? " · " + msg : ""}`);
     const keyName = KEY_ENV[c.provider];
+    if (status === 503 || status === 529 || status === 500) return new HttpError(503, `模型「${model}」暂时繁忙（${status}），已自动重试，请过一会儿再点「重试」`);
     if (status === 401 || status === 403 || status === 400 && /API key|API_KEY/i.test(detail)) return new HttpError(502, `模型密钥无效或没有权限，请检查服务器上的 ${keyName}`);
     if (status === 429) return new HttpError(429, "模型服务繁忙或今日免费额度已用完，请稍后再试");
-    if (status === 404) return new HttpError(502, `模型「${c.model}」不可用，请检查 ${c.provider === "gemini" ? "GEMINI_MODEL" : "ANTHROPIC_MODEL"}`);
+    if (status === 404) return new HttpError(502, `模型「${model}」不可用，请检查 ${c.provider === "gemini" ? "GEMINI_MODEL" : "ANTHROPIC_MODEL"}`);
     if (status === 400 && /location|region|not supported/i.test(detail)) return new HttpError(502, "模型服务在当前地区不可用");
-    return new HttpError(502, `模型服务出错（${status}）`);
+    return new HttpError(502, `模型服务出错（${status}）${msg ? "：" + msg : ""}`);
   }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const RETRYABLE = /* @__PURE__ */ new Set([500, 502, 503, 504, 529]);
   async function callAnthropic(c, mediaType, imageBase64) {
-    const r = await post(c, c.apiUrl, { "x-api-key": c.apiKey, "anthropic-version": "2023-06-01" }, {
-      model: c.model,
-      max_tokens: 6e3,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: mediaType, data: imageBase64 } },
-            { type: "text", text: prompt }
-          ]
-        }
-      ]
-    });
+    let r;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      r = await post(c, c.apiUrl, { "x-api-key": c.apiKey, "anthropic-version": "2023-06-01" }, {
+        model: c.model,
+        max_tokens: 6e3,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: mediaType, data: imageBase64 } },
+              { type: "text", text: prompt }
+            ]
+          }
+        ]
+      });
+      if (r.ok || !RETRYABLE.has(r.status) || attempt === 2) break;
+      await sleep(1500 * (attempt + 1));
+    }
     if (!r.ok) throw upstreamError(c, r.status, await r.text().catch(() => ""));
     const data = await r.json();
     return (data.content || []).filter((x) => x.type === "text").map((x) => x.text).join("");
   }
-  async function callGemini(c, mediaType, imageBase64) {
-    const generationConfig = { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 8192 };
-    if (c.thinking) generationConfig.thinkingConfig = { thinkingLevel: c.thinking };
-    const url = `${c.apiUrl.replace(/\/$/, "")}/models/${encodeURIComponent(c.model)}:generateContent`;
-    const r = await post(c, url, { "x-goog-api-key": c.apiKey }, {
-      contents: [{ role: "user", parts: [{ inline_data: { mime_type: mediaType, data: imageBase64 } }, { text: prompt }] }],
-      generationConfig
-    });
-    if (!r.ok) throw upstreamError(c, r.status, await r.text().catch(() => ""));
-    const data = await r.json();
-    if (data.promptFeedback?.blockReason) throw new HttpError(422, "图片被模型安全策略拦截，请换一张或手工录入");
-    const cand = (data.candidates || [])[0];
-    const text = (cand?.content?.parts || []).filter((p) => typeof p.text === "string" && !p.thought).map((p) => p.text).join("");
-    if (!text) {
-      if (cand?.finishReason === "MAX_TOKENS") throw new HttpError(502, "识别结果太长被截断，请把单据裁成两部分分别识别");
-      throw new HttpError(502, "模型没有返回识别结果，请重试");
+  let modelCache = null;
+  async function discoverModels(c) {
+    if (modelCache && modelCache.key === c.apiKey && Date.now() - modelCache.at < 36e5) return modelCache.list;
+    let list = [];
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 6e3);
+      const r = await fetch(`${c.apiUrl.replace(/\/$/, "")}/models?pageSize=200`, { headers: { "x-goog-api-key": c.apiKey }, signal: ctl.signal });
+      clearTimeout(t);
+      if (r.ok) {
+        const j = await r.json();
+        const ver = (n) => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || "0");
+        list = (j.models || []).filter((m) => (m.supportedGenerationMethods || []).includes("generateContent")).map((m) => String(m.name || "").replace(/^models\//, "")).filter((n) => /^gemini-/.test(n) && /flash/.test(n) && !/image|tts|audio|live|native|embed|computer|robotics/.test(n)).sort((a, b) => Number(/lite/.test(a)) - Number(/lite/.test(b)) || Number(/preview|exp/.test(a)) - Number(/preview|exp/.test(b)) || ver(b) - ver(a));
+        log(`[recognize] available flash models: ${list.slice(0, 8).join(", ") || "(none)"}`);
+      } else log(`[recognize] list models HTTP ${r.status}`);
+    } catch {
+      log("[recognize] list models failed");
     }
-    return text;
+    modelCache = { key: c.apiKey, at: Date.now(), list };
+    return list;
+  }
+  async function callGemini(c, mediaType, imageBase64) {
+    const started = Date.now();
+    const queue = [c.model, ...c.fallbacks.filter((m) => m !== c.model)];
+    let discovered = false;
+    let thinking = c.thinking;
+    const errors = [];
+    for (let i = 0; i < queue.length && i < 4; i++) {
+      const model = queue[i];
+      let modelErr = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const left = c.budget - (Date.now() - started);
+        if (left < 8e3) {
+          modelErr = modelErr || new HttpError(504, "识别超时，请重试或裁小图片");
+          i = queue.length;
+          break;
+        }
+        const generationConfig = { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 16384 };
+        if (thinking) generationConfig.thinkingConfig = { thinkingLevel: thinking };
+        const url = `${c.apiUrl.replace(/\/$/, "")}/models/${encodeURIComponent(model)}:generateContent`;
+        let r;
+        try {
+          r = await post(c, url, { "x-goog-api-key": c.apiKey }, {
+            contents: [{ role: "user", parts: [{ inline_data: { mime_type: mediaType, data: imageBase64 } }, { text: prompt }] }],
+            generationConfig
+          }, Math.min(c.timeout, left));
+        } catch (e) {
+          modelErr = e;
+          if (e instanceof HttpError && e.status === 504) break;
+          continue;
+        }
+        if (r.ok) {
+          const data = await r.json();
+          if (data.promptFeedback?.blockReason) throw new HttpError(422, "图片被模型安全策略拦截，请换一张或手工录入");
+          const cand = (data.candidates || [])[0];
+          const text = (cand?.content?.parts || []).filter((p) => typeof p.text === "string" && !p.thought).map((p) => p.text).join("");
+          if (text) {
+            if (model !== c.model) log(`[recognize] used fallback model ${model}`);
+            return text;
+          }
+          if (cand?.finishReason === "MAX_TOKENS") throw new HttpError(502, "识别结果太长被截断，请把单据裁成两部分分别识别");
+          modelErr = new HttpError(502, "模型没有返回识别结果，请重试");
+          continue;
+        }
+        const detail = await r.text().catch(() => "");
+        if (r.status === 400 && thinking && /thinking/i.test(detail)) {
+          thinking = "";
+          attempt--;
+          continue;
+        }
+        modelErr = upstreamError(c, r.status, detail, model);
+        modelErr.notFound = r.status === 404;
+        if (r.status === 404) break;
+        if (r.status === 429 && /quota|exhaust/i.test(detail)) break;
+        if (!RETRYABLE.has(r.status)) throw modelErr;
+        await sleep(1200 * (attempt + 1));
+      }
+      if (modelErr) errors.push(modelErr);
+      if (i === queue.length - 1 && !discovered) {
+        discovered = true;
+        for (const m of await discoverModels(c)) if (!queue.includes(m)) queue.push(m);
+      }
+    }
+    throw errors.find((e) => !e.notFound) || errors[0] || new HttpError(502, "模型服务出错");
   }
   async function recognize(request, c) {
     const len = Number(request.headers.get("content-length") || 0);
